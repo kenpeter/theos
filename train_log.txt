@@ -1,0 +1,47 @@
+Starting training...
+Tokenizer loaded
+Texts: 145730 train + 200 val
+Tokens: 99,734,786 train, 33,323 val
+Params: 14,969,546
+Dataset: 99733762 samples, 33244587 batches/epoch
+Val: 32299 samples
+Loaded best.pt
+Starting training loop...
+S100 loss=0.0154
+S200 loss=0.0329
+S300 loss=0.0508
+S400 loss=0.0137
+S500 loss=0.0084
+S600 loss=0.0136
+S700 loss=0.0160
+S800 loss=0.0084
+S900 loss=0.0106
+S1000 loss=0.0095
+S1100 loss=0.0055
+S1200 loss=0.0082
+S1300 loss=0.1522
+S1400 loss=0.0496
+S1500 loss=0.0128
+S1600 loss=0.0106
+S1700 loss=0.0108
+S1800 loss=0.0077
+S1900 loss=0.0088
+S2000 loss=0.0072
+S2100 loss=0.0080
+S2200 loss=0.0111
+S2300 loss=0.0083
+S2400 loss=0.0064
+S2500 loss=0.0080
+S2600 loss=0.0078
+S2700 loss=0.0104
+S2800 loss=0.0081
+S2900 loss=0.0088
+S3000 loss=0.0051
+S3100 loss=0.0064
+S3200 loss=0.0058
+S3300 loss=0.0078
+S3400 loss=0.0054
+S3500 loss=0.0077
+S3600 loss=0.0078
+S3700 loss=0.0070
+S3800 loss=0.0058

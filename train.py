@@ -90,17 +90,20 @@ DATASETS = [
     ("code", ("sahil2801/CodeAlpaca-20k",), False, 0,
      lambda r, _: f"<|user|>\n{r['instruction']}\n### Input:\n{r['input']}\n<|assistant|>\n{r['output']}\n<|end|>"),
     ("web", ("HuggingFaceFW/fineweb", "sample-10BT"), True, 100000, None),
-    ("chat", ("timdettmers/openassistant-guanaco",), True, 15000, None),
+    ("oa", ("timdettmers/openassistant-guanaco",), True, 15000, None),
 ]
+
+LEETCODE_PATH = Path("/home/kenpeter/work/data/high_quality_leetcode/train.jsonl")
 
 
 # ── Training ───────────────────────────────────────────────────────
 
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, max_batches=0):
     model.eval()
     total, count = 0.0, 0
     with torch.no_grad():
-        for x, y in loader:
+        for i, (x, y) in enumerate(loader):
+            if max_batches and i >= max_batches: break
             x, y = x.to(device), y.to(device)
             loss = criterion(model(x, n_loops=4).view(-1, model.cfg.vocab_size), y.view(-1))
             total += loss.item() * x.size(0)
@@ -119,7 +122,29 @@ def main():
     parser.add_argument("--log_every", type=int, default=200)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--data_only", action="store_true", help="download & tokenize only, no training")
+    parser.add_argument("--quick", action="store_true", help="short training, fast iteration (200 steps)")
+    parser.add_argument("--eval_steps", type=int, default=0, help="eval on N batches instead of full set (0=all)")
+    parser.add_argument("--patience", type=int, default=5, help="early stop after N saves without improvement")
+    parser.add_argument("--grad_acc", type=int, default=1, help="gradient accumulation steps")
+    parser.add_argument("--micro", action="store_true", help="super tiny test run (20 steps)")
     args = parser.parse_args()
+
+    if args.micro:
+        args.max_steps = 20
+        args.save_every = 10
+        args.log_every = 5
+        args.batch_size = 2
+        args.seq_len = 64
+        args.eval_steps = 5
+        args.patience = 2
+        print("🔬 Micro mode: 20 steps, tiny model, sanity check")
+    elif args.quick:
+        args.max_steps = 200
+        args.save_every = 50
+        args.log_every = 25
+        args.eval_steps = 20
+        args.patience = 2
+        print("⚡ Quick mode: 200 steps, early eval, fast iteration")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -189,36 +214,54 @@ def main():
 
     os.makedirs("checkpoints", exist_ok=True)
     model.train()
+    opt.zero_grad()
+    stall = 0
 
     while step < args.max_steps:
         for x, y in dl:
             x, y = x.to(device), y.to(device)
             loss = crit(model(x, n_loops=4).view(-1, cfg.vocab_size), y.view(-1))
+            loss = loss / args.grad_acc
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step(); sch.step(); opt.zero_grad()
+
+            if (step + 1) % args.grad_acc == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step(); sch.step(); opt.zero_grad()
             step += 1
 
             if step % args.log_every == 0:
-                print(f"S{step} loss={loss.item():.4f} lr={opt.param_groups[0]['lr']:.6f}")
+                print(f"S{step} loss={loss.item() * args.grad_acc:.4f} lr={opt.param_groups[0]['lr']:.6f}")
 
             if step % args.save_every == 0:
-                v = evaluate(model, vl_dl, crit, device)
+                v = evaluate(model, vl_dl, crit, device, args.eval_steps)
                 if v < best_loss:
                     best_loss = v
                     torch.save({"model_state": model.state_dict()}, "checkpoints/best.pt")
                     print(f"  ★ New best val_loss={v:.4f}")
+                    stall = 0
                 else:
-                    print(f"  val_loss={v:.4f} best={best_loss:.4f}")
+                    stall += 1
+                    print(f"  val_loss={v:.4f} best={best_loss:.4f} stall={stall}/{args.patience}")
                 torch.save({"model_state": model.state_dict(), "optimizer": opt.state_dict(),
                             "scheduler": sch.state_dict(), "step": step, "best_loss": best_loss},
                            "checkpoints/latest.pt")
                 model.train()
+                if stall >= args.patience:
+                    print(f"  Early stopping after {stall} stalls")
+                    step = args.max_steps  # break outer loop
+                    break
 
             if step >= args.max_steps: break
         if step >= args.max_steps: break
 
-    print(f"Done. Best val_loss={best_loss:.4f}")
+    print(f"Done {step} steps. Best val_loss={best_loss:.4f}")
+
+    # Quick generate to verify learning
+    model.eval()
+    for prompt in ["def fibonacci", "The meaning of life"]:
+        ids = torch.tensor([tok.encode_prompt(prompt)]).to(device)
+        out = model.generate(ids, max_new_tokens=30, n_loops=4, temperature=0.7)
+        print(f"  Gen: {tok.decode(out[0].tolist())}")
 
 
 if __name__ == "__main__":
