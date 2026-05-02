@@ -96,6 +96,24 @@ DATASETS = [
 LEETCODE_PATH = Path("/home/kenpeter/work/data/high_quality_leetcode/train.jsonl")
 
 
+def _load_local_leetcode():
+    import json
+    cache = CACHE / "leetcode.pkl"
+    if cache.exists():
+        return pickle.load(open(cache, "rb"))
+    texts = []
+    with open(LEETCODE_PATH) as f:
+        for line in f:
+            d = json.loads(line)
+            t = (f"<|user|>\n{d['problem_description']}\n"
+                 f"<|reasoning|>\n{d['high_quality_cot']}\n"
+                 f"<|assistant|>\n{d['completion']}\n<|end|>")
+            texts.append(t)
+    pickle.dump(texts, open(cache, "wb"))
+    print(f"  LeetCode: {len(texts)} texts loaded")
+    return texts
+
+
 # ── Training ───────────────────────────────────────────────────────
 
 def evaluate(model, loader, criterion, device, max_batches=0):
@@ -157,7 +175,8 @@ def main():
         tok = BPETok(8192, "tokenizer.json")
     if not os.path.exists("tokenizer.json"):
         print("Training tokenizer...")
-        sample = _load_or_download("wiki", ("Salesforce/wikitext", "wikitext-2-v1"), False, 0, None)[:5000]
+        sample = _load_or_download("wiki", ("Salesforce/wikitext", "wikitext-2-v1"), False, 0, None)[:3000]
+        sample += _load_local_leetcode()[:500]
         tok.train(sample)
 
     # ── Data ──
@@ -171,6 +190,14 @@ def main():
             val_texts = texts[-200:]
             texts = texts[:-200]
         all_texts.extend(texts)
+    leetcode = _load_local_leetcode()
+    all_texts.extend(leetcode)
+    val_texts = leetcode[-100:] + val_texts
+    syn_path = CACHE / "synthetic_code_reasoning.pkl"
+    if syn_path.exists():
+        syn = pickle.load(open(syn_path, "rb"))
+        all_texts.extend(syn)
+        print(f"  Synthetic: {len(syn)} texts loaded")
 
     print(f"Total texts: {len(all_texts)} training + {len(val_texts)} validation")
 
