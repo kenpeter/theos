@@ -65,7 +65,7 @@ class FlatDataset(Dataset):
 
 # ── Data Loading ───────────────────────────────────────────────────
 
-CACHE = Path("cache")
+CACHE = Path("dataset_cache")
 CACHE.mkdir(exist_ok=True)
 
 def _load_or_download(name, url, streaming=False, max_samples=0, map_fn=None):
@@ -126,6 +126,10 @@ def main():
 
     # ── Tokenizer ──
     tok = BPETok(8192, "tokenizer.json")
+    # Reuse old tokenizer if exists
+    if not os.path.exists("tokenizer.json") and os.path.exists("bpe_tokenizer_8k.json"):
+        os.rename("bpe_tokenizer_8k.json", "tokenizer.json")
+        tok = BPETok(8192, "tokenizer.json")
     if not os.path.exists("tokenizer.json"):
         print("Training tokenizer...")
         sample = _load_or_download("wiki", ("Salesforce/wikitext", "wikitext-2-v1"), False, 0, None)[:5000]
@@ -145,8 +149,10 @@ def main():
 
     print(f"Total texts: {len(all_texts)} training + {len(val_texts)} validation")
 
-    flat_train = tok.tokenize_texts(all_texts, str(CACHE / "train_tokens.npy"))
-    flat_val = tok.tokenize_texts(val_texts, str(CACHE / "val_tokens.npy"))
+    train_cache = "dataset_cache/train_tokens.npy" if os.path.exists("dataset_cache/train_tokens.npy") else str(CACHE / "train_tokens.npy")
+    val_cache = "dataset_cache/val_tokens.npy" if os.path.exists("dataset_cache/val_tokens.npy") else str(CACHE / "val_tokens.npy")
+    flat_train = tok.tokenize_texts(all_texts, train_cache)
+    flat_val = tok.tokenize_texts(val_texts, val_cache)
     print(f"Tokens: {len(flat_train):,} train, {len(flat_val):,} val")
 
     if args.data_only:

@@ -1,5 +1,7 @@
 checkpoints/
 dataset_cache/
+cache/
+tokenizer.json
 bpe_tokenizer.json
 bpe_tokenizer_8k.json
 *.pt
