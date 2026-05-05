@@ -1,8 +1,11 @@
 """
-Consolidated training — downloads data, tokenizes, trains. All in one.
+Multi-stage training with WSD scheduler.
+Stage 1: general + broad code (warmup + stable)
+Stage 2: add reasoning + specialized code (stable)
+Stage 3: highest quality only + annealing (decay LR to 0)
 """
 
-import os, pickle, torch, torch.nn as nn, numpy as np
+import os, pickle, time, torch, torch.nn as nn, numpy as np
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders, processors
@@ -40,27 +43,72 @@ class BPETok:
         if self.EOS in ids: ids = ids[:ids.index(self.EOS)]
         return self.tk.decode(ids)
 
-    def tokenize_texts(self, texts, cache_path):
+    def tokenize_texts(self, texts, cache_path, prog_name=""):
         if cache_path and os.path.exists(cache_path):
-            return np.load(cache_path).tolist()
+            arr = np.load(cache_path)
+            return arr
         flat = []
+        start = time.time()
+        step = max(1, len(texts) // 8)
         for i, t in enumerate(texts):
             flat.extend(self.encode_prompt(t))
+            if prog_name and step > 0 and (i+1) % step == 0:
+                print(f"  tokenizing {prog_name}: {i+1}/{len(texts)} ({len(flat):,} tok, {time.time()-start:.0f}s)")
+        arr = np.array(flat, dtype=np.int32)
         if cache_path:
-            np.save(cache_path, np.array(flat, dtype=np.int32))
-        return flat
+            np.save(cache_path, arr)
+        return arr
 
 
 # ── Dataset ────────────────────────────────────────────────────────
 
 class FlatDataset(Dataset):
     def __init__(self, tokens, seq_len):
-        self.tokens, self.seq_len = tokens, seq_len
+        self.tokens = tokens
+        self.seq_len = seq_len
     def __len__(self):
         return max(0, len(self.tokens) - self.seq_len)
     def __getitem__(self, i):
         return (torch.tensor(self.tokens[i:i+self.seq_len], dtype=torch.long),
                 torch.tensor(self.tokens[i+1:i+self.seq_len+1], dtype=torch.long))
+
+
+# ── WSD Scheduler ──────────────────────────────────────────────────
+
+class WSDScheduler:
+    def __init__(self, optimizer, warmup_steps=200, peak_lr=3e-4):
+        self.optimizer = optimizer
+        self.warmup_steps = warmup_steps
+        self.peak_lr = peak_lr
+        self._step = 0
+        self._mode = "warmup"
+        self._decay_start = None
+        self._decay_steps = None
+        self._set_lr(0.0)
+
+    def _set_lr(self, lr):
+        for pg in self.optimizer.param_groups:
+            pg["lr"] = lr
+
+    def step(self):
+        self._step += 1
+        if self._mode == "warmup":
+            progress = min(1.0, self._step / max(1, self.warmup_steps))
+            self._set_lr(self.peak_lr * progress)
+            if self._step >= self.warmup_steps:
+                self._mode = "stable"
+        elif self._mode == "stable":
+            self._set_lr(self.peak_lr)
+        elif self._mode == "decay":
+            elapsed = self._step - self._decay_start
+            progress = min(1.0, elapsed / max(1, self._decay_steps))
+            self._set_lr(self.peak_lr * max(0.0, 1.0 - progress))
+
+    def begin_decay(self, decay_steps):
+        self._mode = "decay"
+        self._decay_start = self._step
+        self._decay_steps = decay_steps
+        print(f"  Annealing started: LR decays to 0 over {decay_steps} steps")
 
 
 # ── Data Loading ───────────────────────────────────────────────────
@@ -89,12 +137,12 @@ DATASETS = [
     ("wiki", ("Salesforce/wikitext", "wikitext-2-v1"), False, 0, None),
     ("code", ("sahil2801/CodeAlpaca-20k",), False, 0,
      lambda r, _: f"<|user|>\n{r['instruction']}\n### Input:\n{r['input']}\n<|assistant|>\n{r['output']}\n<|end|>"),
-    ("web", ("HuggingFaceFW/fineweb", "sample-10BT"), True, 100000, None),
+    ("web", ("HuggingFaceFW/fineweb", "sample-10BT"), True, 50000, None),
     ("oa", ("timdettmers/openassistant-guanaco",), True, 15000, None),
 ]
 
 LEETCODE_PATH = Path("/home/kenpeter/work/data/high_quality_leetcode/train.jsonl")
-
+DATA_CACHE = Path("/home/kenpeter/work/data/_cache")
 
 def _load_local_leetcode():
     import json
@@ -114,7 +162,31 @@ def _load_local_leetcode():
     return texts
 
 
-# ── Training ───────────────────────────────────────────────────────
+def _load_code_datasets():
+    """Load new code datasets from /home/kenpeter/work/data/_cache/."""
+    code_files = ["codeparrot_clean", "self_oss_instruct", "codefeedback", "dolphin_coder", "smoltalk"]
+    max_per_dataset = {"codeparrot_clean": 50000, "smoltalk": 50000}
+    train_all, val_all = [], []
+    for name in code_files:
+        path = DATA_CACHE / f"{name}.pkl"
+        if not path.exists():
+            print(f"  ⚠ {name}.pkl not found, skipping")
+            continue
+        texts = pickle.load(open(path, "rb"))
+        limit = max_per_dataset.get(name, len(texts))
+        if limit < len(texts):
+            texts = texts[:limit]
+            print(f"  trimmed {name} to {limit}")
+        split = max(1, len(texts) // 20)
+        if split > 10000:
+            split = 10000
+        train_all.extend(texts[:-split])
+        val_all.extend(texts[-split:])
+        print(f"  ✓ {name}: {len(texts)} texts")
+    return train_all, val_all
+
+
+# ── Evaluation ────────────────────────────────────────────────────
 
 def evaluate(model, loader, criterion, device, max_batches=0):
     model.eval()
@@ -123,11 +195,35 @@ def evaluate(model, loader, criterion, device, max_batches=0):
         for i, (x, y) in enumerate(loader):
             if max_batches and i >= max_batches: break
             x, y = x.to(device), y.to(device)
-            loss = criterion(model(x, n_loops=4).view(-1, model.cfg.vocab_size), y.view(-1))
+            logits, _ = model(x, n_loops=4)
+            loss = criterion(logits.view(-1, model.cfg.vocab_size), y.view(-1))
             total += loss.item() * x.size(0)
             count += x.size(0)
-    return total / count
+    return total / count if count > 0 else 0.0
 
+
+def eval_code_syntax(model, tok, device, n_samples=4):
+    prompts = [
+        "def fibonacci(n):",
+        "def sort_array(arr):",
+        "class Stack:",
+        "def binary_search(arr, target):",
+    ]
+    model.eval()
+    score = 0.0
+    for prompt in prompts[:n_samples]:
+        ids = torch.tensor([tok.encode_prompt(prompt)]).to(device)
+        out = model.generate(ids, max_new_tokens=40, n_loops=4, temperature=0.7)
+        text = tok.decode(out[0].tolist())
+        try:
+            compile(text, "<eval>", "exec")
+            score += 1.0
+        except SyntaxError:
+            pass
+    return score / max(1, n_samples)
+
+
+# ── Main ───────────────────────────────────────────────────────────
 
 def main():
     import argparse
@@ -139,37 +235,43 @@ def main():
     parser.add_argument("--save_every", type=int, default=2000)
     parser.add_argument("--log_every", type=int, default=200)
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--data_only", action="store_true", help="download & tokenize only, no training")
-    parser.add_argument("--quick", action="store_true", help="short training, fast iteration (200 steps)")
-    parser.add_argument("--eval_steps", type=int, default=0, help="eval on N batches instead of full set (0=all)")
-    parser.add_argument("--patience", type=int, default=5, help="early stop after N saves without improvement")
-    parser.add_argument("--grad_acc", type=int, default=1, help="gradient accumulation steps")
-    parser.add_argument("--micro", action="store_true", help="super tiny test run (20 steps)")
+    parser.add_argument("--data_only", action="store_true")
+    parser.add_argument("--quick", action="store_true")
+    parser.add_argument("--eval_steps", type=int, default=50)
+    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument("--grad_acc", type=int, default=1)
+    parser.add_argument("--micro", action="store_true")
+    parser.add_argument("--cooldown", type=float, default=0.0)
+    parser.add_argument("--aux_scale", type=float, default=0.01)
+    parser.add_argument("--synth_only", action="store_true")
+    parser.add_argument("--warmup", type=int, default=200)
+    # Stage controls
+    parser.add_argument("--stage1_pct", type=float, default=0.60, help="% of steps for stage 1")
+    parser.add_argument("--stage2_pct", type=float, default=0.25, help="% of steps for stage 2")
     args = parser.parse_args()
 
     if args.micro:
-        args.max_steps = 20
+        args.max_steps = 30
         args.save_every = 10
         args.log_every = 5
         args.batch_size = 2
         args.seq_len = 64
         args.eval_steps = 5
         args.patience = 2
-        print("🔬 Micro mode: 20 steps, tiny model, sanity check")
+        print("Micro mode: 30 steps")
     elif args.quick:
-        args.max_steps = 200
+        args.max_steps = 300
         args.save_every = 50
         args.log_every = 25
         args.eval_steps = 20
         args.patience = 2
-        print("⚡ Quick mode: 200 steps, early eval, fast iteration")
+        print("Quick mode: 300 steps")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
     # ── Tokenizer ──
     tok = BPETok(8192, "tokenizer.json")
-    # Reuse old tokenizer if exists
     if not os.path.exists("tokenizer.json") and os.path.exists("bpe_tokenizer_8k.json"):
         os.rename("bpe_tokenizer_8k.json", "tokenizer.json")
         tok = BPETok(8192, "tokenizer.json")
@@ -180,35 +282,53 @@ def main():
         tok.train(sample)
 
     # ── Data ──
-    for name, url, streaming, max_s, fn in DATASETS:
-        _load_or_download(name, url, streaming, max_s, fn)
-
-    all_texts, val_texts = [], []
-    for name, _, _, _, _ in DATASETS:
-        texts = pickle.load(open(CACHE / f"{name}.pkl", "rb"))
-        if name == "wiki":
-            val_texts = texts[-200:]
-            texts = texts[:-200]
-        all_texts.extend(texts)
-    leetcode = _load_local_leetcode()
-    all_texts.extend(leetcode)
-    val_texts = leetcode[-100:] + val_texts
     syn_path = CACHE / "synthetic_code_reasoning.pkl"
-    if syn_path.exists():
+    all_texts, val_texts = [], []
+
+    if args.synth_only:
+        print("Synth-only mode")
         syn = pickle.load(open(syn_path, "rb"))
-        all_texts.extend(syn)
-        print(f"  Synthetic: {len(syn)} texts loaded")
+        split = max(1, len(syn) // 20)
+        all_texts = syn[:-split]
+        val_texts = syn[-split:]
+    else:
+        for name, url, streaming, max_s, fn in DATASETS:
+            _load_or_download(name, url, streaming, max_s, fn)
+        for name, _, _, _, _ in DATASETS:
+            texts = pickle.load(open(CACHE / f"{name}.pkl", "rb"))
+            if name == "wiki":
+                val_texts.extend(texts[-200:])
+                texts = texts[:-200]
+            all_texts.extend(texts)
 
-    print(f"Total texts: {len(all_texts)} training + {len(val_texts)} validation")
+        leetcode = _load_local_leetcode()
+        all_texts.extend(leetcode[:-100])
+        val_texts.extend(leetcode[-100:])
 
-    train_cache = "dataset_cache/train_tokens.npy" if os.path.exists("dataset_cache/train_tokens.npy") else str(CACHE / "train_tokens.npy")
-    val_cache = "dataset_cache/val_tokens.npy" if os.path.exists("dataset_cache/val_tokens.npy") else str(CACHE / "val_tokens.npy")
-    flat_train = tok.tokenize_texts(all_texts, train_cache)
-    flat_val = tok.tokenize_texts(val_texts, val_cache)
+        if syn_path.exists():
+            syn = pickle.load(open(syn_path, "rb"))
+            split = max(1, len(syn) // 20)
+            all_texts.extend(syn[:-split])
+            val_texts.extend(syn[-split:])
+
+        # New code datasets
+        code_train, code_val = _load_code_datasets()
+        all_texts.extend(code_train)
+        val_texts.extend(code_val)
+
+    print(f"Total texts: {len(all_texts)} train + {len(val_texts)} val")
+
+    # Tokenize
+    tok_cache = CACHE / "token_cache"
+    tok_cache.mkdir(exist_ok=True)
+    train_cache = str(tok_cache / "train.npy")
+    val_cache = str(tok_cache / "val.npy")
+    flat_train = tok.tokenize_texts(all_texts, train_cache, "train")
+    flat_val = tok.tokenize_texts(val_texts, val_cache, "val")
     print(f"Tokens: {len(flat_train):,} train, {len(flat_val):,} val")
 
     if args.data_only:
-        print("Data ready. Run without --data_only to train.")
+        print("Data ready.")
         return
 
     # ── Model ──
@@ -216,74 +336,128 @@ def main():
     model = TinyModel(cfg).to(device)
     print(f"Params: {model.num_parameters():,}")
 
-    ds = FlatDataset(flat_train, args.seq_len)
-    vl = FlatDataset(flat_val, args.seq_len)
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, num_workers=0, drop_last=True)
-    vl_dl = DataLoader(vl, batch_size=args.batch_size, shuffle=False, num_workers=0)
-
-    crit = nn.CrossEntropyLoss()
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
-    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.max_steps)
+    sched = WSDScheduler(opt, warmup_steps=args.warmup, peak_lr=args.lr)
+    crit = nn.CrossEntropyLoss()
 
+    # Validation loader
+    val_ds = FlatDataset(flat_val, args.seq_len)
+    val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+
+    # Stage boundaries
+    stage1_end = int(args.max_steps * args.stage1_pct)
+    stage2_end = stage1_end + int(args.max_steps * args.stage2_pct)
+
+    # ── Resume ──
     step, best_loss = 0, float("inf")
     if args.resume and os.path.exists("checkpoints/latest.pt"):
         ckpt = torch.load("checkpoints/latest.pt", map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state"])
         opt.load_state_dict(ckpt["optimizer"])
-        sch.load_state_dict(ckpt["scheduler"])
+        sched._step = ckpt.get("step", 0)
         step = ckpt.get("step", 0)
         best_loss = ckpt.get("best_loss", float("inf"))
+        sched._mode = ckpt.get("sched_mode", "warmup")
         print(f"Resumed at step {step}")
-    elif os.path.exists("checkpoints/best.pt"):
-        ckpt = torch.load("checkpoints/best.pt", map_location=device, weights_only=False)
-        model.load_state_dict(ckpt.get("model_state", ckpt))
-        print("Loaded best.pt, starting fresh scheduler")
 
     os.makedirs("checkpoints", exist_ok=True)
     model.train()
     opt.zero_grad()
     stall = 0
 
-    while step < args.max_steps:
-        for x, y in dl:
-            x, y = x.to(device), y.to(device)
-            loss = crit(model(x, n_loops=4).view(-1, cfg.vocab_size), y.view(-1))
-            loss = loss / args.grad_acc
-            loss.backward()
+    # Create training dataloader (use infinite sampler to avoid huge randperm)
+    train_ds = FlatDataset(flat_train, args.seq_len)
 
-            if (step + 1) % args.grad_acc == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step(); sch.step(); opt.zero_grad()
-            step += 1
+    class InfiniteSampler(torch.utils.data.Sampler):
+        def __init__(self, n):
+            self.n = n
+        def __iter__(self):
+            while True:
+                yield from (int(i) for i in torch.randint(0, self.n, (self.n // 1000 + 1,)))
+        def __len__(self):
+            return self.n
 
-            if step % args.log_every == 0:
-                print(f"S{step} loss={loss.item() * args.grad_acc:.4f} lr={opt.param_groups[0]['lr']:.6f}")
+    sampler = InfiniteSampler(len(train_ds))
+    train_dl = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, num_workers=0, drop_last=True)
+    train_iter = iter(train_dl)
+    current_stage = 0  # 0=stage1, 1=stage2, 2=stage3
 
-            if step % args.save_every == 0:
-                v = evaluate(model, vl_dl, crit, device, args.eval_steps)
-                if v < best_loss:
-                    best_loss = v
-                    torch.save({"model_state": model.state_dict()}, "checkpoints/best.pt")
-                    print(f"  ★ New best val_loss={v:.4f}")
-                    stall = 0
-                else:
-                    stall += 1
-                    print(f"  val_loss={v:.4f} best={best_loss:.4f} stall={stall}/{args.patience}")
-                torch.save({"model_state": model.state_dict(), "optimizer": opt.state_dict(),
-                            "scheduler": sch.state_dict(), "step": step, "best_loss": best_loss},
-                           "checkpoints/latest.pt")
-                model.train()
-                if stall >= args.patience:
-                    print(f"  Early stopping after {stall} stalls")
-                    step = args.max_steps  # break outer loop
-                    break
+    for step in range(step, args.max_steps):
+        # Check stage transition
+        new_stage = 0
+        if step >= stage2_end:
+            new_stage = 2
+        elif step >= stage1_end:
+            new_stage = 1
 
-            if step >= args.max_steps: break
-        if step >= args.max_steps: break
+        if new_stage != current_stage:
+            current_stage = new_stage
+            stage_names = ["Stage 1 — General + Broad Code",
+                           "Stage 2 — Reasoning + Specialized Code",
+                           "Stage 3 — High Quality + Annealing"]
+            print(f"\n{'='*50}")
+            print(f"Entering {stage_names[current_stage]}")
+            if current_stage == 2:
+                decay_steps = args.max_steps - step
+                sched.begin_decay(decay_steps)
+            # Re-shuffle data for new stage
+            train_iter = iter(train_dl)
+            print(f"{'='*50}\n")
 
-    print(f"Done {step} steps. Best val_loss={best_loss:.4f}")
+        # Training step
+        try:
+            x, y = next(train_iter)
+        except StopIteration:
+            train_iter = iter(train_dl)
+            x, y = next(train_iter)
 
-    # Quick generate to verify learning
+        x, y = x.to(device), y.to(device)
+        logits, aux_loss = model(x, n_loops=4)
+        nll = crit(logits.view(-1, cfg.vocab_size), y.view(-1))
+        loss = nll + args.aux_scale * aux_loss
+        loss = loss / args.grad_acc
+        loss.backward()
+
+        if (step + 1) % args.grad_acc == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            sched.step()
+            opt.zero_grad()
+        nll_val = nll.item()
+
+        if args.cooldown > 0:
+            time.sleep(args.cooldown)
+
+        if step % args.log_every == 0:
+            lr = opt.param_groups[0]["lr"]
+            stage_names = ["S1", "S2", "S3"]
+            print(f"S{step} [{stage_names[current_stage]}] loss={nll_val:.4f} lr={lr:.2e}")
+
+        if step > 0 and step % args.save_every == 0:
+            v = evaluate(model, val_dl, crit, device, args.eval_steps)
+            code_acc = eval_code_syntax(model, tok, device)
+            if v < best_loss:
+                best_loss = v
+                torch.save({"model_state": model.state_dict()}, "checkpoints/best.pt")
+                print(f"  ★ Best val_loss={v:.4f} code_acc={code_acc:.2f}")
+                stall = 0
+            else:
+                stall += 1
+                print(f"  val_loss={v:.4f} code_acc={code_acc:.2f} best={best_loss:.4f} stall={stall}/{args.patience}")
+            torch.save({
+                "model_state": model.state_dict(),
+                "optimizer": opt.state_dict(),
+                "sched_mode": sched._mode,
+                "step": step, "best_loss": best_loss,
+            }, "checkpoints/latest.pt")
+            model.train()
+            if stall >= args.patience:
+                print(f"  Early stopping")
+                break
+
+    print(f"\nDone {step+1} steps. Best val_loss={best_loss:.4f}")
+
+    # Quick generation test
     model.eval()
     for prompt in ["def fibonacci", "The meaning of life"]:
         ids = torch.tensor([tok.encode_prompt(prompt)]).to(device)
