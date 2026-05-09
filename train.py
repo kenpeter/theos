@@ -340,6 +340,36 @@ def evaluate(model, loader, criterion, device, max_batches=0):
     return total / count if count > 0 else 0.0
 
 
+class MetricsTracker:
+    def __init__(self, path):
+        self.path = path
+        self.history = []
+        if os.path.exists(path):
+            try:
+                import json
+                self.history = json.load(open(path))
+            except: pass
+
+    def log(self, step, train_loss, val_loss, code_acc, lr, best_loss):
+        import json
+        import datetime
+        entry = {
+            "step": step, "train_loss": round(train_loss, 4),
+            "val_loss": round(val_loss, 4) if val_loss else None,
+            "code_acc": round(code_acc, 4) if code_acc else None,
+            "lr": lr, "best_loss": round(best_loss, 4),
+            "time": datetime.datetime.now().isoformat(),
+        }
+        self.history.append(entry)
+        json.dump(self.history, open(self.path, "w"), indent=2)
+
+    def stall_count(self, key="val_loss", patience=3):
+        recent = [e[key] for e in self.history[-patience:] if e.get(key) is not None]
+        if len(recent) < patience:
+            return 0
+        return sum(1 for i in range(1, len(recent)) if recent[i] >= recent[i-1])
+
+
 def eval_code_syntax(model, tok, device, n_samples=4):
     prompts = [
         "def fibonacci(n):",
@@ -383,6 +413,16 @@ def main():
     parser.add_argument("--aux_scale", type=float, default=0.01)
     parser.add_argument("--synth_only", action="store_true")
     parser.add_argument("--warmup", type=int, default=200)
+    parser.add_argument("--amp", action="store_true", help="Enable mixed precision training")
+    parser.add_argument("--num_workers", type=int, default=2, help="DataLoader workers")
+    parser.add_argument("--pin_memory", action="store_true", default=True, help="Pin memory for DataLoader")
+    parser.add_argument("--compile", action="store_true", help="Use torch.compile for model optimization")
+    parser.add_argument("--lr_patience", type=int, default=3, help="Evals without improvement before LR decay")
+    parser.add_argument("--lr_decay", type=float, default=0.5, help="LR decay factor on plateau")
+    parser.add_argument("--metrics_file", type=str, default="training_metrics.json", help="Metrics log path")
+    parser.add_argument("--dropout", type=float, default=0.2, help="Dropout rate")
+    parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
+    parser.add_argument("--label_smooth", type=float, default=0.1, help="Label smoothing epsilon")
     # Stage controls
     parser.add_argument("--stage1_pct", type=float, default=0.60, help="% of steps for stage 1")
     parser.add_argument("--stage2_pct", type=float, default=0.25, help="% of steps for stage 2")
@@ -407,6 +447,8 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
 
     # ── Tokenizer ──
     tok = BPETok(8192, "tokenizer.json")
@@ -487,17 +529,24 @@ def main():
         return
 
     # ── Model ──
-    cfg = TinyConfig()
+    cfg = TinyConfig(dropout=args.dropout)
     model = TinyModel(cfg).to(device)
     print(f"Params: {model.num_parameters():,}")
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    if args.compile and hasattr(torch, "compile"):
+        model = torch.compile(model)
+        print("Compiled with torch.compile")
+
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = WSDScheduler(opt, warmup_steps=args.warmup, peak_lr=args.lr)
-    crit = nn.CrossEntropyLoss()
+    crit = nn.CrossEntropyLoss(label_smoothing=args.label_smooth)
+    scaler = torch.amp.GradScaler(device.type) if args.amp and device.type == "cuda" else None
+    metrics = MetricsTracker(args.metrics_file)
+    lr_stall = 0
 
     # Validation loader
     val_ds = FlatDataset(flat_val, args.seq_len)
-    val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=args.pin_memory)
 
     # Stage boundaries
     stage1_end = int(args.max_steps * args.stage1_pct)
@@ -513,7 +562,9 @@ def main():
         step = ckpt.get("step", 0)
         best_loss = ckpt.get("best_loss", float("inf"))
         sched._mode = ckpt.get("sched_mode", "warmup")
-        print(f"Resumed at step {step}")
+        lr_stall = ckpt.get("lr_stall", 0)
+        sched.peak_lr = ckpt.get("peak_lr", args.lr)
+        print(f"Resumed at step {step} (LR={sched.peak_lr:.2e})")
 
     os.makedirs("checkpoints", exist_ok=True)
     model.train()
@@ -533,9 +584,10 @@ def main():
             return self.n
 
     sampler = InfiniteSampler(len(train_ds))
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, num_workers=0, drop_last=True)
+    train_dl = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers, pin_memory=args.pin_memory, drop_last=True)
     train_iter = iter(train_dl)
     current_stage = 0  # 0=stage1, 1=stage2, 2=stage3
+    t0 = time.time()
 
     for step in range(step, args.max_steps):
         # Check stage transition
@@ -567,15 +619,24 @@ def main():
             x, y = next(train_iter)
 
         x, y = x.to(device), y.to(device)
-        logits, aux_loss = model(x, n_loops=4)
-        nll = crit(logits.view(-1, cfg.vocab_size), y.view(-1))
-        loss = nll + args.aux_scale * aux_loss
-        loss = loss / args.grad_acc
-        loss.backward()
+        with torch.amp.autocast(device_type=device.type, enabled=scaler is not None, dtype=torch.bfloat16):
+            logits, aux_loss = model(x, n_loops=4)
+            nll = crit(logits.view(-1, cfg.vocab_size), y.view(-1))
+            loss = nll + args.aux_scale * aux_loss
+            loss = loss / args.grad_acc
+
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         if (step + 1) % args.grad_acc == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            if scaler is not None:
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
             sched.step()
             opt.zero_grad()
         nll_val = nll.item()
@@ -586,24 +647,37 @@ def main():
         if step % args.log_every == 0:
             lr = opt.param_groups[0]["lr"]
             stage_names = ["S1", "S2", "S3"]
-            print(f"S{step} [{stage_names[current_stage]}] loss={nll_val:.4f} lr={lr:.2e}")
+            elapsed = time.time() - t0
+            print(f"S{step} [{stage_names[current_stage]}] loss={nll_val:.4f} lr={lr:.2e} t={elapsed:.0f}s")
 
         if step > 0 and step % args.save_every == 0:
             v = evaluate(model, val_dl, crit, device, args.eval_steps)
             code_acc = eval_code_syntax(model, tok, device)
-            if v < best_loss:
+            metrics.log(step, nll_val, v, code_acc, opt.param_groups[0]["lr"], best_loss)
+            improved = v < best_loss
+            if improved:
                 best_loss = v
                 torch.save({"model_state": model.state_dict()}, "checkpoints/best.pt")
                 print(f"  ★ Best val_loss={v:.4f} code_acc={code_acc:.2f}")
                 stall = 0
+                lr_stall = 0
             else:
                 stall += 1
+                lr_stall += 1
                 print(f"  val_loss={v:.4f} code_acc={code_acc:.2f} best={best_loss:.4f} stall={stall}/{args.patience}")
+                # Adaptive LR decay on plateau (only during stable stage, not during planned decay)
+                if lr_stall >= args.lr_patience and sched._mode == "stable":
+                    new_lr = opt.param_groups[0]["lr"] * args.lr_decay
+                    sched.peak_lr = new_lr
+                    sched._set_lr(new_lr)
+                    lr_stall = 0
+                    print(f"  ◆ Adaptive LR decay to {new_lr:.2e} (plateau x{args.lr_patience})")
             torch.save({
                 "model_state": model.state_dict(),
                 "optimizer": opt.state_dict(),
                 "sched_mode": sched._mode,
                 "step": step, "best_loss": best_loss,
+                "lr_stall": lr_stall, "peak_lr": sched.peak_lr,
             }, "checkpoints/latest.pt")
             model.train()
             if stall >= args.patience:

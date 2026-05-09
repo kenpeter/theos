@@ -7,3 +7,5 @@ bpe_tokenizer_8k.json
 *.pt
 __pycache__/
 *.pyc
+*.log
+training_metrics.json
