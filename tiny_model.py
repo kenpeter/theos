@@ -26,15 +26,15 @@ import torch.nn.functional as F
 @dataclass
 class TinyConfig:
     vocab_size: int = 8192
-    dim: int = 256
-    n_heads: int = 4
+    dim: int = 512
+    n_heads: int = 8
     max_seq_len: int = 1024
     max_loop_iters: int = 4
-    prelude_layers: int = 1
-    coda_layers: int = 1
+    prelude_layers: int = 4
+    coda_layers: int = 4
     act_threshold: float = 0.9
     rope_theta: float = 10000.0
-    lora_rank: int = 12
+    lora_rank: int = 16
     dropout: float = 0.1
     tie_weights: bool = True
     n_experts: int = 8

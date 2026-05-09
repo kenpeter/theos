@@ -43,17 +43,25 @@ class BPETok:
         if self.EOS in ids: ids = ids[:ids.index(self.EOS)]
         return self.tk.decode(ids)
 
+    MAX_TEXT_CHARS = 20000
+
     def tokenize_texts(self, texts, cache_path, prog_name=""):
         if cache_path and os.path.exists(cache_path):
             arr = np.load(cache_path)
             return arr
         flat = []
         start = time.time()
+        skipped = 0
         step = max(1, len(texts) // 8)
         for i, t in enumerate(texts):
+            if len(t) > self.MAX_TEXT_CHARS or "\x00" in t:
+                skipped += 1
+                continue
             flat.extend(self.encode_prompt(t))
             if prog_name and step > 0 and (i+1) % step == 0:
-                print(f"  tokenizing {prog_name}: {i+1}/{len(texts)} ({len(flat):,} tok, {time.time()-start:.0f}s)")
+                print(f"  tokenizing {prog_name}: {i+1}/{len(texts)} ({len(flat):,} tok, {time.time()-start:.0f}s, skipped={skipped})")
+        if skipped:
+            print(f"  skipped {skipped} texts over {self.MAX_TEXT_CHARS} chars or with null bytes")
         arr = np.array(flat, dtype=np.int32)
         if cache_path:
             np.save(cache_path, arr)
@@ -139,33 +147,163 @@ DATASETS = [
      lambda r, _: f"<|user|>\n{r['instruction']}\n### Input:\n{r['input']}\n<|assistant|>\n{r['output']}\n<|end|>"),
     ("web", ("HuggingFaceFW/fineweb", "sample-10BT"), True, 50000, None),
     ("oa", ("timdettmers/openassistant-guanaco",), True, 15000, None),
+    ("magicoder", ("ise-uiuc/Magicoder-Evol-Instruct-110K",), True, 50000,
+     lambda r, _: f"<|user|>\n{r['instruction']}\n<|assistant|>\n{r['response']}\n<|end|>"),
 ]
 
-LEETCODE_PATH = Path("/home/kenpeter/work/data/high_quality_leetcode/train.jsonl")
+LEETCODE_BASE = Path("/home/kenpeter/work/data")
 DATA_CACHE = Path("/home/kenpeter/work/data/_cache")
 
-def _load_local_leetcode():
-    import json
-    cache = CACHE / "leetcode.pkl"
+def _fmt(problem, reasoning="", code=""):
+    if reasoning and code:
+        return f"<|user|>\n{problem}\n<|reasoning|>\n{reasoning}\n<|assistant|>\n{code}\n<|end|>"
+    elif code:
+        return f"<|user|>\n{problem}\n<|assistant|>\n{code}\n<|end|>"
+    else:
+        return f"<|user|>\n{problem}\n<|assistant|>\nI'd be happy to help solve this problem.\n<|end|>"
+
+def _load_all_leetcode():
+    """Load ALL LeetCode datasets from /home/kenpeter/work/data/."""
+    import json, pandas as pd
+    cache = CACHE / "all_leetcode.pkl"
     if cache.exists():
         return pickle.load(open(cache, "rb"))
     texts = []
-    with open(LEETCODE_PATH) as f:
-        for line in f:
-            d = json.loads(line)
-            t = (f"<|user|>\n{d['problem_description']}\n"
-                 f"<|reasoning|>\n{d['high_quality_cot']}\n"
-                 f"<|assistant|>\n{d['completion']}\n<|end|>")
-            texts.append(t)
+
+    # 1. high_quality_leetcode (2,638 rows) — problem + CoT + code
+    hq_path = LEETCODE_BASE / "high_quality_leetcode" / "train.jsonl"
+    if hq_path.exists():
+        with open(hq_path) as f:
+            for line in f:
+                d = json.loads(line)
+                texts.append(_fmt(d["problem_description"], d["high_quality_cot"], d["completion"]))
+        print(f"  ✓ high_quality_leetcode: {sum(1 for _ in open(hq_path))}")
+
+    # 2. LeetCode_YT_CC_CoT_Summary (17,053 rows) — problem + summary CoT + python code
+    yt_dir = LEETCODE_BASE / "LeetCode_YT_CC_CoT_Summary" / "data"
+    for fn in sorted(yt_dir.glob("*.parquet")):
+        df = pd.read_parquet(fn)
+        for _, r in df.iterrows():
+            texts.append(_fmt(r["question_content"], r.get("Summary", ""), r.get("python", "")))
+        print(f"  ✓ LeetCode_YT_CC_CoT_Summary ({fn.name}): {len(df)}")
+
+    # 3. DenCT_LeetCode (19,011 rows) — problem + explanation (code is embedded in content)
+    denct_path = LEETCODE_BASE / "DenCT_LeetCode" / "leetcode-java-python.parquet"
+    if denct_path.exists():
+        df = pd.read_parquet(denct_path)
+        for _, r in df.iterrows():
+            problem = r.get("question_content", "")
+            reasoning = r.get("content", "")
+            texts.append(_fmt(problem, reasoning, ""))
+        print(f"  ✓ DenCT_LeetCode: {len(df)}")
+
+    # 4. LimYeri_LeetCode (15,734 rows) — conversations array with system/user/assistant
+    lim_path = LEETCODE_BASE / "LimYeri_LeetCode" / "train.parquet"
+    if lim_path.exists():
+        df = pd.read_parquet(lim_path)
+        count = 0
+        for _, r in df.iterrows():
+            convs = r.get("conversations", [])
+            problem, reasoning, code = "", "", ""
+            for msg in convs:
+                if isinstance(msg, dict):
+                    role = msg.get("from", "")
+                    val = msg.get("value", "")
+                    if role == "user":
+                        problem = val
+                    elif role == "assistant":
+                        if "```" in val:
+                            parts = val.split("```")
+                            reasoning = parts[0].strip()
+                            code = "```" + "```".join(parts[1:]) if len(parts) > 1 else ""
+                        else:
+                            reasoning = val
+            if problem:
+                texts.append(_fmt(problem, reasoning, code))
+                count += 1
+        print(f"  ✓ LimYeri_LeetCode: {count}")
+
+    # 5. mesolitica_LeetCodeQwQ (1,561 rows) — problem + QwQ reasoning + code
+    qwq_path = LEETCODE_BASE / "mesolitica_LeetCodeQwQ" / "train.parquet"
+    if qwq_path.exists():
+        df = pd.read_parquet(qwq_path)
+        for _, r in df.iterrows():
+            texts.append(_fmt(r["content"], r.get("qwq", ""), r.get("solution", "")))
+        print(f"  ✓ mesolitica_LeetCodeQwQ: {len(df)}")
+
+    # 6. newfacade_LeetCodeDataset (2,869 rows) — problem + response reasoning + completion code
+    nf_dir = LEETCODE_BASE / "newfacade_LeetCodeDataset"
+    for fn in ["leetcode_train.jsonl", "leetcode_test.jsonl"]:
+        p = nf_dir / fn
+        if p.exists():
+            with open(p) as f:
+                count = 0
+                for line in f:
+                    d = json.loads(line)
+                    texts.append(_fmt(d["problem_description"], d.get("response", ""), d.get("completion", "")))
+                    count += 1
+            print(f"  ✓ newfacade_LeetCodeDataset ({fn}): {count}")
+
+    # 7. greengerong_LeetCode (2,360 rows) — problem + python (explanation + code in one field)
+    gg_path = LEETCODE_BASE / "greengerong_LeetCode" / "leetcode-train.jsonl"
+    if gg_path.exists():
+        with open(gg_path) as f:
+            count = 0
+            for line in f:
+                d = json.loads(line)
+                py_code = d.get("python", "")
+                texts.append(_fmt(d["content"], "", py_code))
+                count += 1
+        print(f"  ✓ greengerong_LeetCode: {count}")
+
+    # 8. juyoungml_LeetCodeRosetta (2,359 rows) — problem + python code (no reasoning)
+    jr_path = LEETCODE_BASE / "juyoungml_LeetCodeRosetta" / "data" / "train-00000-of-00001.parquet"
+    if jr_path.exists():
+        df = pd.read_parquet(jr_path)
+        for _, r in df.iterrows():
+            texts.append(_fmt(r["content"], "", r.get("python_code", "")))
+        print(f"  ✓ juyoungml_LeetCodeRosetta: {len(df)}")
+
+    # 9. vovw_LeetCode (2,360 rows) — problem + python code (no reasoning)
+    vovw_path = LEETCODE_BASE / "vovw_LeetCode" / "dataset.parquet"
+    if vovw_path.exists():
+        df = pd.read_parquet(vovw_path)
+        for _, r in df.iterrows():
+            texts.append(_fmt(r["content"], "", r.get("python", "")))
+        print(f"  ✓ vovw_LeetCode: {len(df)}")
+
     pickle.dump(texts, open(cache, "wb"))
-    print(f"  LeetCode: {len(texts)} texts loaded")
+    print(f"  Total All LeetCode: {len(texts)} texts loaded")
+    return texts
+
+
+def _load_roleplay():
+    """Load bluemoon_roleplay data as general dialogue text."""
+    import pyarrow as pa
+    cache = CACHE / "roleplay.pkl"
+    if cache.exists():
+        return pickle.load(open(cache, "rb"))
+    arrow_path = LEETCODE_BASE / "bluemoon_roleplay" / "train" / "data-00000-of-00001.arrow"
+    if not arrow_path.exists():
+        print("  ⚠ roleplay not found, skipping")
+        return []
+    with pa.memory_map(str(arrow_path), "rb") as mm:
+        reader = pa.ipc.RecordBatchStreamReader(mm)
+        table = reader.read_all()
+    texts = []
+    for i in range(len(table)):
+        msg = table.column("message")[i].as_py()
+        if msg and len(msg) >= 100:
+            texts.append(f"<|user|>\nContinue the story.\n<|assistant|>\n{msg}\n<|end|>")
+    pickle.dump(texts, open(cache, "wb"))
+    print(f"  ✓ bluemoon_roleplay: {len(texts)} texts")
     return texts
 
 
 def _load_code_datasets():
     """Load new code datasets from /home/kenpeter/work/data/_cache/."""
     code_files = ["codeparrot_clean", "self_oss_instruct", "codefeedback", "dolphin_coder", "smoltalk"]
-    max_per_dataset = {"codeparrot_clean": 50000, "smoltalk": 50000}
+    max_per_dataset = {"smoltalk": 50000}
     train_all, val_all = [], []
     for name in code_files:
         path = DATA_CACHE / f"{name}.pkl"
@@ -301,15 +439,32 @@ def main():
                 texts = texts[:-200]
             all_texts.extend(texts)
 
-        leetcode = _load_local_leetcode()
-        all_texts.extend(leetcode[:-100])
-        val_texts.extend(leetcode[-100:])
+        leetcode = _load_all_leetcode()
+        split = max(1, len(leetcode) // 20)
+        if split > 5000: split = 5000
+        all_texts.extend(leetcode[:-split])
+        val_texts.extend(leetcode[-split:])
 
         if syn_path.exists():
             syn = pickle.load(open(syn_path, "rb"))
             split = max(1, len(syn) // 20)
             all_texts.extend(syn[:-split])
             val_texts.extend(syn[-split:])
+
+        # Roleplay data
+        roleplay = _load_roleplay()
+        split = max(1, len(roleplay) // 20)
+        all_texts.extend(roleplay[:-split])
+        val_texts.extend(roleplay[-split:])
+
+        # Harvested LeetCode data
+        harvest_path = CACHE / "harvested_data.pkl"
+        if harvest_path.exists():
+            harvest = pickle.load(open(harvest_path, "rb"))
+            split = max(1, len(harvest) // 20)
+            all_texts.extend(harvest[:-split])
+            val_texts.extend(harvest[-split:])
+            print(f"  ✓ harvested LeetCode: {len(harvest)} texts")
 
         # New code datasets
         code_train, code_val = _load_code_datasets()
