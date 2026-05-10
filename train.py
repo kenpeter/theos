@@ -72,13 +72,19 @@ class BPETok:
 
 class FlatDataset(Dataset):
     def __init__(self, tokens, seq_len):
-        self.tokens = tokens
         self.seq_len = seq_len
+        if isinstance(tokens, np.ndarray):
+            self.tokens = torch.from_numpy(tokens).long()
+        else:
+            self.tokens = torch.tensor(tokens, dtype=torch.long)
+
     def __len__(self):
         return max(0, len(self.tokens) - self.seq_len)
+
     def __getitem__(self, i):
-        return (torch.tensor(self.tokens[i:i+self.seq_len], dtype=torch.long),
-                torch.tensor(self.tokens[i+1:i+self.seq_len+1], dtype=torch.long))
+        x = self.tokens[i : i + self.seq_len]
+        y = self.tokens[i + 1 : i + self.seq_len + 1]
+        return x.clone(), y.clone()
 
 
 # ── WSD Scheduler ──────────────────────────────────────────────────
@@ -402,7 +408,8 @@ def main():
     parser.add_argument("--max_steps", type=int, default=50000)
     parser.add_argument("--save_every", type=int, default=2000)
     parser.add_argument("--log_every", type=int, default=200)
-    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint (auto-detected if exists)")
+    parser.add_argument("--fresh", action="store_true", help="Force fresh training, ignore checkpoints")
     parser.add_argument("--data_only", action="store_true")
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--eval_steps", type=int, default=50)
@@ -420,7 +427,7 @@ def main():
     parser.add_argument("--lr_patience", type=int, default=3, help="Evals without improvement before LR decay")
     parser.add_argument("--lr_decay", type=float, default=0.5, help="LR decay factor on plateau")
     parser.add_argument("--metrics_file", type=str, default="training_metrics.json", help="Metrics log path")
-    parser.add_argument("--dropout", type=float, default=0.2, help="Dropout rate")
+    parser.add_argument("--dropout", type=float, default=0.1, help="Dropout rate")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
     parser.add_argument("--label_smooth", type=float, default=0.1, help="Label smoothing epsilon")
     # Stage controls
@@ -458,7 +465,7 @@ def main():
     if not os.path.exists("tokenizer.json"):
         print("Training tokenizer...")
         sample = _load_or_download("wiki", ("Salesforce/wikitext", "wikitext-2-v1"), False, 0, None)[:3000]
-        sample += _load_local_leetcode()[:500]
+        sample += _load_all_leetcode()[:500]
         tok.train(sample)
 
     # ── Data ──
@@ -533,6 +540,20 @@ def main():
     model = TinyModel(cfg).to(device)
     print(f"Params: {model.num_parameters():,}")
 
+    # ── Smoke test: verify generate() produces real tokens ──
+    _smoke_ids = torch.tensor([tok.encode_prompt("def hello(")]).to(device)
+    with torch.no_grad():
+        _smoke_out = model.generate(_smoke_ids, max_new_tokens=10, n_loops=4, temperature=0.3)
+    _smoke_decoded = tok.decode(_smoke_out[0].tolist())
+    if len(_smoke_decoded) <= len("def hello("):
+        print("SMOKE FAIL: generate() produces no new tokens. Aborting.", flush=True)
+        return
+    _unique_chars = len(set(_smoke_decoded.strip()))
+    if _unique_chars <= 3:
+        print(f"SMOKE WARN: generate() output is degenerate ({_unique_chars} unique chars). Proceed with caution.", flush=True)
+    else:
+        print(f"SMOKE OK: generate() produces {_unique_chars} unique chars.", flush=True)
+
     if args.compile and hasattr(torch, "compile"):
         model = torch.compile(model)
         print("Compiled with torch.compile")
@@ -540,21 +561,23 @@ def main():
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = WSDScheduler(opt, warmup_steps=args.warmup, peak_lr=args.lr)
     crit = nn.CrossEntropyLoss(label_smoothing=args.label_smooth)
-    scaler = torch.amp.GradScaler(device.type) if args.amp and device.type == "cuda" else None
+    scaler = None  # bfloat16 doesn't need GradScaler
     metrics = MetricsTracker(args.metrics_file)
     lr_stall = 0
 
     # Validation loader
     val_ds = FlatDataset(flat_val, args.seq_len)
-    val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=args.pin_memory)
+    val_dl = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=args.pin_memory, persistent_workers=args.num_workers > 0)
 
     # Stage boundaries
     stage1_end = int(args.max_steps * args.stage1_pct)
     stage2_end = stage1_end + int(args.max_steps * args.stage2_pct)
 
-    # ── Resume ──
+    # ── Resume (auto-detects if checkpoint exists) ──
     step, best_loss = 0, float("inf")
-    if args.resume and os.path.exists("checkpoints/latest.pt"):
+    has_ckpt = os.path.exists("checkpoints/latest.pt")
+    should_resume = (args.resume or has_ckpt) and not args.fresh
+    if should_resume and has_ckpt:
         ckpt = torch.load("checkpoints/latest.pt", map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model_state"])
         opt.load_state_dict(ckpt["optimizer"])
@@ -564,7 +587,12 @@ def main():
         sched._mode = ckpt.get("sched_mode", "warmup")
         lr_stall = ckpt.get("lr_stall", 0)
         sched.peak_lr = ckpt.get("peak_lr", args.lr)
-        print(f"Resumed at step {step} (LR={sched.peak_lr:.2e})")
+        print(f"Resumed at step {step} (LR={sched.peak_lr:.2e})", flush=True)
+    elif args.fresh and has_ckpt:
+        os.remove("checkpoints/latest.pt")
+        if os.path.exists("checkpoints/best.pt"):
+            os.remove("checkpoints/best.pt")
+        print("Fresh start — cleared checkpoints", flush=True)
 
     os.makedirs("checkpoints", exist_ok=True)
     model.train()
@@ -584,7 +612,7 @@ def main():
             return self.n
 
     sampler = InfiniteSampler(len(train_ds))
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers, pin_memory=args.pin_memory, drop_last=True)
+    train_dl = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers, pin_memory=args.pin_memory, drop_last=True, persistent_workers=args.num_workers > 0)
     train_iter = iter(train_dl)
     current_stage = 0  # 0=stage1, 1=stage2, 2=stage3
     t0 = time.time()
@@ -650,6 +678,15 @@ def main():
             elapsed = time.time() - t0
             print(f"S{step} [{stage_names[current_stage]}] loss={nll_val:.4f} lr={lr:.2e} t={elapsed:.0f}s")
 
+        if step > 0 and step % args.log_every == 0:
+            torch.save({
+                "model_state": model.state_dict(),
+                "optimizer": opt.state_dict(),
+                "sched_mode": sched._mode,
+                "step": step, "best_loss": best_loss,
+                "lr_stall": lr_stall, "peak_lr": sched.peak_lr,
+            }, "checkpoints/latest.pt")
+
         if step > 0 and step % args.save_every == 0:
             v = evaluate(model, val_dl, crit, device, args.eval_steps)
             code_acc = eval_code_syntax(model, tok, device)
@@ -680,6 +717,31 @@ def main():
                 "lr_stall": lr_stall, "peak_lr": sched.peak_lr,
             }, "checkpoints/latest.pt")
             model.train()
+
+            # ── Eval Gate: real code evaluation ──
+            if step >= 10000:
+                import subprocess as _sp
+                try:
+                    _eg = _sp.run(
+                        ["python3", "eval_real.py", "checkpoints/best.pt"],
+                        capture_output=True, text=True, timeout=120,
+                    )
+                    _passes = _eg.stdout.count("[PASS]")
+                    _fails = _eg.stdout.count("[FAIL]")
+                    _total = _passes + _fails
+                    _compile_ok = _eg.stdout.count("syntax error") + _eg.stdout.count("no valid def")
+                    _compile_acc = max(0, (_total - _compile_ok)) / max(1, _total)
+                    print(f"  ╔══════════════════════════════════════╗", flush=True)
+                    print(f"  ║   EVAL GATE — Step {step}", flush=True)
+                    print(f"  ║   tests: {_passes}/{_total}  |  compile: {_compile_acc:.0%}", flush=True)
+                    status = "GREEN" if _passes > 0 else ("YELLOW" if _compile_acc >= 0.10 else "RED")
+                    print(f"  ║   status: {status}", flush=True)
+                    print(f"  ╚══════════════════════════════════════╝", flush=True)
+                    if step >= 30000 and _total > 0 and _compile_acc < 0.10:
+                        print(f"  ███ EVAL GATE: HALTING — compile_acc={_compile_acc:.2f} at step {step}", flush=True)
+                        break
+                except Exception as _e:
+                    print(f"  Eval Gate: skipped ({_e})", flush=True)
             if stall >= args.patience:
                 print(f"  Early stopping")
                 break

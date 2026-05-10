@@ -19,7 +19,7 @@ class TinyConfig:
     act_threshold: float = 0.9
     rope_theta: float = 10000.0
     lora_rank: int = 16
-    dropout: float = 0.2
+    dropout: float = 0.1
     tie_weights: bool = True
 
 
@@ -242,6 +242,9 @@ class TinyModel(nn.Module):
         )
         self.register_buffer("freqs_cis", freqs)
 
+        causal_mask = torch.triu(torch.full((1, 1, cfg.max_seq_len, cfg.max_seq_len), float("-inf")), diagonal=1)
+        self.register_buffer("causal_mask", causal_mask)
+
         self.looped = LoopedBlock(cfg)
 
         self.norm = RMSNorm(cfg.dim)
@@ -273,7 +276,7 @@ class TinyModel(nn.Module):
 
         x = self.embed(input_ids)
         freqs_cis = self.freqs_cis[start_pos : start_pos + T]
-        mask = self._causal_mask(T, device, x.dtype) if T > 1 else None
+        mask = self.causal_mask[:, :, :T, :T] if T > 1 else None
 
         e = x
         x = self.looped(x, e, freqs_cis, mask, n_loops)
@@ -291,19 +294,13 @@ class TinyModel(nn.Module):
         repetition_penalty: float = 1.2,
     ) -> torch.Tensor:
         for step in range(max_new_tokens):
-            if step == 0:
-                cur_ids = input_ids
-                start_pos = 0
-            else:
-                cur_ids = input_ids[:, -1:]
-                start_pos = input_ids.shape[1] - 1
-
-            logits, _ = self.forward(cur_ids, n_loops=n_loops, start_pos=start_pos)
+            logits, _ = self.forward(input_ids, n_loops=n_loops)
             logits = logits[:, -1, :] / temperature
 
-            if repetition_penalty != 1.0 and step > 0:
-                for token_id in input_ids[0].tolist():
-                    logits[0, token_id] /= repetition_penalty
+            if repetition_penalty != 1.0:
+                counts = torch.bincount(input_ids[0], minlength=logits.shape[-1])
+                mask = counts > 0
+                logits[0, mask] /= repetition_penalty ** counts[mask].float()
 
             if top_k > 0:
                 v, _ = logits.topk(top_k)
