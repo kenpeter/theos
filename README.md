@@ -1,84 +1,114 @@
 # Theos
 
-Small language model — Recurrent-Depth Transformer with Linear Attention.
-Trained on 1.86B tokens across 3 stages. phi-1 philosophy: small model, max data.
-
-## Architecture
+## Forward Pass
 
 ```
-Input → [Prelude ×4: StandardAttention + SwiGLU FFN]
-       → [RecurrentBlock ×1 (looped 4x): GatedLinearAttention + MoE-FFN (8 experts, top-2)]
-       → [Coda ×4: StandardAttention + SwiGLU FFN]
-       → Output
+Input BPE Tokens (max_len=1024)
+    │
+    ▼
+  Embed  8192 → 1280  (tied with Head)
+    │
+    ▼
+┌──────────────────────────────────────────────────────────────┐
+│                    LoopedBlock (weight-tied)                  │
+│                                                              │
+│  for t in 0..n_loops:                                        │
+│    │                                                         │
+│    ├─ loop_index_embedding(t) ─→ h                           │
+│    ├─ RMSNorm(h + e)                                         │
+│    │      │                                                  │
+│    │      ├─► Multi-Head Attention (20 heads × dim=64)       │
+│    │      │     · RoPE (θ=10000)                             │
+│    │      │     · Causal mask                                │
+│    │      │     · SDPA flash attention                       │
+│    │      │                                                  │
+│    │      ├─► SwiGLU FFN (dim×4 hidden)                      │
+│    │      │     gate(x) → silu → * up(x) → down              │
+│    │      │                                                  │
+│    │      └─► LoRA Adapter (rank=16)                         │
+│    │            down(1280→16) × scale(t) × B(16→1280)        │
+│    │                                                         │
+│    ├─ residual + dropout(0.1)                                │
+│    │                                                         │
+│    ├─ ACT Halting                                            │
+│    │   p ← σ(halt_proj(h))      halted when Σp ≥ 0.9         │
+│    │   output ← Σ p_t · h_t                                  │
+│    │                                                         │
+│    └─ LTI Injection                                          │
+│        A ← exp(-exp(log_dt + log_A))                         │
+│        h ← A·h + B·e + trans_out                             │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+    │
+    ▼
+  RMSNorm
+    │
+    ▼
+  Head  1280 → 8192  (tied with Embed)
+    │
+    ▼
+  Logits → Top-k(40) · Temp(0.8) · RepPenalty(1.2) → token
 ```
 
-| Config | Value |
-|--------|-------|
-| Params | ~35M |
-| Dim | 512 |
-| Heads | 8 (head_dim=64) |
-| Seq len | 1024 |
-| Vocab | 8192 BPE tokens |
-| Recurrent loops | 4 (weight-tied) |
-| ACT halting | threshold=0.9 |
-| MoE | 8 experts, top-2 |
-| LoRA per-loop | rank=16 |
+## Training Schedule (WSD)
 
-## Multi-Stage Training (WSD Scheduler)
+```
+  LR
+   │
+3e-4 ─────────────────────●──────────●
+   │                    ╱              ╲
+   │                  ╱                  ╲
+   │                ╱                      ╲
+   │              ╱                          ╲
+ 0 ─┼─────────●──┼───────────────────────────●───► steps
+   0         200       210k        297.5k    350k
+   │         │         │           │          │
+   │ Warmup  │  Stable │  Stable   │  Anneal  │
+   │         │         │           │          │
+   │ general │ general │ reasoning │ high-q   │
+   │ + code  │ + code  │ + code    │ only     │
+```
 
-Three stages inspired by SmolLM2 data curriculum:
+```
+plateau detected (3 evals no Δ) → LR × 0.5
+```
 
-### Stage 1 — General + Broad Code (60% of steps, ~30k)
-- Warmup 200 steps → stable LR 3e-4
-- Heavy on codeparrot-clean + FineWeb
-- Purpose: language modeling + broad code patterns
+## Data Pipeline
 
-### Stage 2 — Reasoning + Specialized Code (25% of steps, ~12.5k)
-- Stable LR 3e-4
-- Shift toward LeetCode, Dolphin-Coder, CodeFeedback
-- Purpose: CoT reasoning, instruction following, algorithmic thinking
+```
+Raw texts
+    │
+    ▼
+ BPETokenizer.train(vocab=8192)  →  encode_prompt()
+    │
+    ▼
+ flat int32 array
+    │
+    ▼
+ FlatDataset (sliding window, seq_len=1024)
+    │
+    ▼
+ InfiniteSampler  →  DataLoader  →  training loop
+```
 
-### Stage 3 — High Quality + Annealing (15% of steps, ~7.5k)
-- Linear LR decay 3e-4 → 0
-- Highest quality data: Self-OSS-Instruct, LeetCode, synthetic
-- Purpose: polish — biggest capability jump per step
+## Specs
 
-## Data Sources
+| Param | Value | | Param | Value |
+|-------|-------|--|-------|-------|
+| Total params | 36.7M | | LoRA rank | 16 |
+| Embed dim | 1280 | | Dropout | 0.1 |
+| Heads | 20 (d=64) | | Max loops | 6 |
+| Vocab size | 8192 (BPE) | | ACT halt threshold | 0.9 |
+| Max seq len | 1024 | | Weight tying | embed ↔ head |
+| Training loops | 4 | | Rep penalty | 1.2 |
 
-| Dataset | Count | Type |
-|---------|-------|------|
-| codeparrot_clean | 500k | Multi-language code |
-| Self-OSS-Instruct | 50,661 | Python code instruct |
-| CodeFeedback | 50k | Code instructions |
-| Dolphin-Coder | 50k | Code instructions |
-| SmolTalk | 50k (trimmed) | Instruction data |
-| Magicoder | 50k (sampled) | Evol-instruct code |
-| FineWeb | 50k (sampled) | General web text |
-| LeetCode (9 datasets) | ~66k | Code problems + CoT |
-| CodeAlpaca-20k | ~20k | Code instructions |
-| WikiText-2 | ~16k | General text |
-| OpenAssistant Guanaco | ~15k | Assistant convos |
-| Roleplay | ~large | Dialogue text |
-| Harvested LeetCode | ~3.5k | Code + reasoning |
-| Synthetic | ~240 | Hand-crafted reasoning |
+## Generation
 
-**Total: 1.12M training texts → 1.86B tokens**
-
-## Training
-
-```bash
-# Fresh train (50k steps, 3 stages)
-python3 train.py --batch_size 2
-
-# Resume from latest checkpoint
-python3 train.py --batch_size 2 --resume
-
-# Quick test (300 steps)
-python3 train.py --quick
-
-# Micro sanity check
-python3 train.py --micro
-
-# Tokenize data only (no training)
-python3 train.py --data_only
+```
+seed_prompt → encode → for each new token:
+    │                       │
+    ▼                       ├─ full seq re-encoded
+  full seq ───────────────► ├─ RepPenalty(1.2)
+                            ├─ Top-k(40)
+                            └─ Temp(0.8) → sample → append
 ```

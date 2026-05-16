@@ -4,7 +4,7 @@ Run: python3 test_gene_status.py
 """
 import os, sys, json, re
 
-SKILLS_DIR = os.path.expanduser("~/.opencode/skills")
+SKILLS_DIR = os.path.expanduser("~/.opencode/genes")
 AGENTS_MD = os.path.expanduser("~/.opencode/AGENTS.md")
 STATUS_LOG = "gene_status_log.md"
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -18,6 +18,7 @@ EXPECTED_GENES = [
     "evomap-gene-ralph-loop",
     "evomap-gene-training-resilience",
     "evomap-gene-fast-feedback",
+    "evomap-gene-reflect",
     "evomap-gene-status",
     "evomap-gene-eval-gate",
     "evomap-gene-coordinator",

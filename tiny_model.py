@@ -14,6 +14,7 @@ class TinyConfig:
     vocab_size: int = 8192
     dim: int = 1280
     n_heads: int = 20
+    n_blocks: int = 2
     max_seq_len: int = 1024
     max_loop_iters: int = 6
     act_threshold: float = 0.9
@@ -245,7 +246,8 @@ class TinyModel(nn.Module):
         causal_mask = torch.triu(torch.full((1, 1, cfg.max_seq_len, cfg.max_seq_len), float("-inf")), diagonal=1)
         self.register_buffer("causal_mask", causal_mask)
 
-        self.looped = LoopedBlock(cfg)
+        self.looped = nn.ModuleList([LoopedBlock(cfg) for _ in range(cfg.n_blocks)])
+        self.post_loop_norms = nn.ModuleList([RMSNorm(cfg.dim) for _ in range(cfg.n_blocks)])
 
         self.norm = RMSNorm(cfg.dim)
         self.head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
@@ -279,7 +281,9 @@ class TinyModel(nn.Module):
         mask = self.causal_mask[:, :, :T, :T] if T > 1 else None
 
         e = x
-        x = self.looped(x, e, freqs_cis, mask, n_loops)
+        for i, (block, norm) in enumerate(zip(self.looped, self.post_loop_norms)):
+            x = block(x, e, freqs_cis, mask, n_loops)
+            x = norm(x)
 
         return self.head(self.norm(x)), x.new_zeros(1).squeeze()
 

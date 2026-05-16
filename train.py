@@ -378,16 +378,16 @@ class MetricsTracker:
 
 def eval_code_syntax(model, tok, device, n_samples=4):
     prompts = [
-        "def fibonacci(n):",
-        "def sort_array(arr):",
-        "class Stack:",
-        "def binary_search(arr, target):",
+        "<|user|>\nWrite a Python function that returns the nth Fibonacci number.\n<|assistant|>\ndef fibonacci(n):",
+        "<|user|>\nWrite a Python function that sorts an array.\n<|assistant|>\ndef sort_array(arr):",
+        "<|user|>\nWrite a Python class implementing a stack.\n<|assistant|>\nclass Stack:",
+        "<|user|>\nWrite a Python function that performs binary search.\n<|assistant|>\ndef binary_search(arr, target):",
     ]
     model.eval()
     score = 0.0
     for prompt in prompts[:n_samples]:
         ids = torch.tensor([tok.encode_prompt(prompt)]).to(device)
-        out = model.generate(ids, max_new_tokens=40, n_loops=4, temperature=0.7)
+        out = model.generate(ids, max_new_tokens=60, n_loops=4, temperature=0.3, top_k=40)
         text = tok.decode(out[0].tolist())
         try:
             compile(text, "<eval>", "exec")
