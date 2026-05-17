@@ -10,17 +10,18 @@ while true; do
 
     python3 -u train.py \
         --batch_size 2 \
-        --max_steps 350000 \
+        --max_steps 500000 \
         --save_every 5000 \
         --amp \
+        --cooldown 1.0 \
         --resume 2>&1
 
     EXIT=$?
 
     # Check if actually done (reached max_steps)
     LAST_STEP=$(python3 -c "import torch; c=torch.load('checkpoints/latest.pt',map_location='cpu',weights_only=False); print(c['step'])" 2>/dev/null)
-    if [ "$LAST_STEP" -ge 350000 ] 2>/dev/null; then
-        echo "[$(date)] Reached max_steps ($LAST_STEP/350000). Done."
+    if [ "$LAST_STEP" -ge 500000 ] 2>/dev/null; then
+        echo "[$(date)] Reached max_steps ($LAST_STEP/500000). Done."
         break
     fi
 

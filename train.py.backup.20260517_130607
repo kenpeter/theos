@@ -90,24 +90,10 @@ class FlatDataset(Dataset):
 # ── WSD Scheduler ──────────────────────────────────────────────────
 
 class WSDScheduler:
-    """Warmup-Stable-Decay scheduler with automatic stage transitions.
-    
-    Uses step-based boundaries instead of time-based:
-    - warmup: ramp up from 0 to peak_lr
-    - stable: hold peak_lr
-    - decay: cosine annealing to 白水_lr*0.01
-    """
-    def __init__(self, optimizer, warmup_steps=200, peak_lr=3e-4, total_steps=500000):
+    def __init__(self, optimizer, warmup_steps=200, peak_lr=3e-4):
         self.optimizer = optimizer
         self.warmup_steps = warmup_steps
         self.peak_lr = peak_lr
-        self.total_steps = total_steps
-        
-        # Stage boundaries (percentage of total)
-        self._warmup_end = int(total_steps * 0.06)  # ~30K for 500K
-        self._stable_end = int(total_steps * 0.60)  # decay starts at ~300K for 500K
-        self._decay_end = total_steps
-        
         self._step = 0
         self._mode = "warmup"
         self._decay_start = None
@@ -120,37 +106,23 @@ class WSDScheduler:
 
     def step(self):
         self._step += 1
-        s = self._step
-        
-        if s <= self._warmup_end:
-            # Warmup
-            progress = min(1.0, s / max(1, self.warmup_steps))
+        if self._mode == "warmup":
+            progress = min(1.0, self._step / max(1, self.warmup_steps))
             self._set_lr(self.peak_lr * progress)
-            self._mode = "warmup"
-        elif s <= self._stable_end:
-            # Stable (constant)
+            if self._step >= self.warmup_steps:
+                self._mode = "stable"
+        elif self._mode == "stable":
             self._set_lr(self.peak_lr)
-            self._mode = "stable"
-        elif s <= self._decay_end:
-            # Decay - cosine annealing starting from peak_lr
-            elapsed = s - self._stable_end
-            decay_steps = self._decay_end - self._stable_end
-            progress = min(1.0, elapsed / max(1, decay_steps))
-            self._mode = "decay"
-            # Cosine annealing: lr = peak * 0.5 * (1 + cos(pi * progress))
-            lr = self.peak_lr * 0.5 * (1.0 + np.cos(np.pi * progress))
-            self._set_lr(lr)
-        else:
-            # Post-decay: tiny LR
-            self._set_lr(self.peak_lr * 0.01)
-            self._mode = "stable_low"
+        elif self._mode == "decay":
+            elapsed = self._step - self._decay_start
+            progress = min(1.0, elapsed / max(1, self._decay_steps))
+            self._set_lr(self.peak_lr * max(0.0, 1.0 - progress))
 
     def begin_decay(self, decay_steps):
-        # Kept for backward compatibility but now automatic
         self._mode = "decay"
         self._decay_start = self._step
         self._decay_steps = decay_steps
-        print(f"  Annealing triggered (automatic from S{self._step})")
+        print(f"  Annealing started: LR decays to 0 over {decay_steps} steps")
 
 
 # ── Data Loading ───────────────────────────────────────────────────

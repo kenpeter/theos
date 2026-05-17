@@ -1,0 +1,60 @@
+[Sun May 17 11:31:16 AM AEST 2026] Starting/resuming training (attempt 1/100)...
+Device: cuda
+  ✓ harvested LeetCode: 3527 texts
+  ✓ codeparrot_clean: 500000 texts
+  ✓ self_oss_instruct: 50661 texts
+  ✓ codefeedback: 50000 texts
+  ✓ dolphin_coder: 50000 texts
+  trimmed smoltalk to 50000
+  ✓ smoltalk: 50000 texts
+Total texts: 1123805 train + 35881 val
+Tokens: 1,865,062,831 train, 48,288,985 val
+Params: 63,015,876
+SMOKE OK: generate() produces 26 unique chars.
+Resumed at step 2000 (LR=3.00e-04)
+S2000 [S1] loss=3.4385 lr=3.00e-04 t=1s
+S2200 [S1] loss=3.8170 lr=3.00e-04 t=234s
+S2400 [S1] loss=2.8105 lr=3.00e-04 t=467s
+S2600 [S1] loss=4.8897 lr=3.00e-04 t=700s
+S2800 [S1] loss=3.0364 lr=3.00e-04 t=933s
+S3000 [S1] loss=4.1823 lr=3.00e-04 t=1166s
+S3200 [S1] loss=3.0986 lr=3.00e-04 t=1399s
+S3400 [S1] loss=5.5919 lr=3.00e-04 t=1632s
+S3600 [S1] loss=2.9148 lr=3.00e-04 t=1864s
+S3800 [S1] loss=3.9869 lr=3.00e-04 t=2097s
+S4000 [S1] loss=3.6634 lr=3.00e-04 t=2330s
+S4200 [S1] loss=3.8811 lr=3.00e-04 t=2563s
+S4400 [S1] loss=3.2591 lr=3.00e-04 t=2796s
+S4600 [S1] loss=2.7184 lr=3.00e-04 t=3029s
+S4800 [S1] loss=3.3403 lr=3.00e-04 t=3262s
+S5000 [S1] loss=3.1220 lr=3.00e-04 t=3495s
+  ★ Best val_loss=6.3679 code_acc=0.00
+S5200 [S1] loss=2.9065 lr=3.00e-04 t=3733s
+S5400 [S1] loss=2.6317 lr=3.00e-04 t=3966s
+S5600 [S1] loss=2.8960 lr=3.00e-04 t=4199s
+S5800 [S1] loss=4.5266 lr=3.00e-04 t=4432s
+S6000 [S1] loss=2.4793 lr=3.00e-04 t=4665s
+S6200 [S1] loss=2.9107 lr=3.00e-04 t=4898s
+S6400 [S1] loss=2.2475 lr=3.00e-04 t=5131s
+S6600 [S1] loss=2.6254 lr=3.00e-04 t=5364s
+S6800 [S1] loss=2.4352 lr=3.00e-04 t=5596s
+Terminated                 python3 -u train.py --batch_size 2 --max_steps 500000 --save_every 5000 --amp --cooldown 1.0 --resume 2>&1
+[Sun May 17 01:06:01 PM AEST 2026] Exited 143 (step=6800), restarting in 3s...
+[Sun May 17 01:06:05 PM AEST 2026] Starting/resuming training (attempt 2/100)...
+Device: cuda
+  ✓ harvested LeetCode: 3527 texts
+  ✓ codeparrot_clean: 500000 texts
+  ✓ self_oss_instruct: 50661 texts
+  ✓ codefeedback: 50000 texts
+  ✓ dolphin_coder: 50000 texts
+  trimmed smoltalk to 50000
+  ✓ smoltalk: 50000 texts
+Total texts: 1123805 train + 35881 val
+Tokens: 1,865,062,831 train, 48,288,985 val
+Params: 63,015,876
+SMOKE OK: generate() produces 23 unique chars.
+Resumed at step 6800 (LR=3.00e-04)
+S6800 [S1] loss=2.7384 lr=3.00e-04 t=1s
+S7000 [S1] loss=2.2862 lr=3.00e-04 t=234s
+S7200 [S1] loss=4.8124 lr=3.00e-04 t=468s
+S7400 [S1] loss=1.7201 lr=3.00e-04 t=701s

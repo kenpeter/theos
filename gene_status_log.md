@@ -32,3 +32,37 @@
 - **Gene skills**: Created gene-training-resilience, gene-fast-feedback, gene-status
 
 ---
+
+## 2026-05-17T02:06 — Theos Training Session (Current)
+
+**Project**: theos (TinyModel recurrent-depth transformer training)  
+**Task**: Monitor training progress, quick eval, gene status session audit
+
+| # | Gene | Status | Applied This Run |
+|---|------|--------|-------------------|
+| 1 | gene-repair | Active+Standby | No code fixes needed this session |
+| 2 | gene-innovate | Active+Standby | No new features or root-cause analysis |
+| 3 | gene-optimize-prompt | Active+Standby | Pending data/prompt optimization |
+| 4 | gene-optimize-tool | Active+Used | Batched scan + log reads efficiently |
+| 5 | gene-env-vars | Active+Standby | No .env or env var handling needed |
+| 6 | gene-ralph-loop | Active+Standby | No PRD-driven iteration this session |
+| 7 | gene-training-resilience | Active+Used | Monitored checkpointing (auto-resume active), latest.pt at S~3300 |
+| 8 | gene-fast-feedback | Active+Used | Quick eval of training loss (loss oscillating ~3.5, not dropping) |
+| 9 | gene-index | Active+Used | Routed signals to correct genes (eval → fast-feedback) |
+| 10 | evolver-model-training | Active+Standby | Monitored but did not patch training code this session |
+| 11 | evolver-integration | Active+Standby | No full diagnostic cycle initiated |
+| 12 | gene-coordinator | Active+Used | Autonomous monitor active, checked quality, reported status |
+| 13 | gene-eval-gate | Active+Used | Checkpoint eval: lossVolatile, steps=3200, verdict=needsOptimization |
+| 14 | gene-status | Active+Used | This report — mandatory gene tracker invoked |
+| 15 | evomap-all-capsules | Active+Standby | No marketplace capsule applied |
+| 16 | evomap-model-training-library | Active+Standby | No library pattern applied |
+
+**Summary**: 6/16 genes Active+Used, 10/16 Active+Standby, 0 Not Installed
+
+### Key Observations This Session
+- **Training Health**: Step ~3300 / 500000, loss oscillating 2.8–4.9 (avg ~3.5). Not dropping steadily.
+- **Checkpointing**: `latest.pt` (~761MB) saved May 17 11:54, auto-resume from S2000 confirmed.
+- **GENE-EVAL-GATE**: Loss not improving past 30K steps protocol. Verdict: **needsOptimization** — LR or data mixing issue likely.
+- **EvoMap Gene-Coordinator**: Monitored, no code changes applied (training still running).
+
+---
