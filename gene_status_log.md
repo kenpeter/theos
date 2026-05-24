@@ -66,3 +66,16 @@
 - **EvoMap Gene-Coordinator**: Monitored, no code changes applied (training still running).
 
 ---
+
+## 2026-05-17T21:27:14.UTC
+
+## Gene Status — This Conversation
+
+| Gene | Used? | What It Did |
+|------|-------|-------------|
+| evomap-gene-status | ✅ | Loaded and generating this report |
+| evomap-gene-index | ✅ | Loaded for signal routing (mandatory) |
+| evomap-gene-training-resilience | ✅ | Started resilient training loop via run.sh |
+
+Summary: 3/14 used, 11 standby
+

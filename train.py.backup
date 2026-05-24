@@ -517,7 +517,7 @@ def main():
             all_texts.extend(texts)
 
         leetcode = _load_all_leetcode()
-        split = max(1, len(leetcode) // 5)
+        split = max(1, len(leetcode) // 20)
         if split > 5000: split = 5000
         all_texts.extend(leetcode[:-split])
         val_texts.extend(leetcode[-split:])
